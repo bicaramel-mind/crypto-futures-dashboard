@@ -1,0 +1,5 @@
+[tool.poetry]
+name = "perp-intel"
+version = "0.1.0"
+description = "Perpetual futures funding/OI/basis intelligence terminal"
+packages = [{ include = "perp_intel", from = "src" }]
