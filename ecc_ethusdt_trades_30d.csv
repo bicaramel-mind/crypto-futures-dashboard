@@ -1,0 +1,2 @@
+entry_ts,exit_ts,side,entry,exit,size_notional,pnl_usd,reason
+2026-02-06 00:00:00+00:00,2026-02-06 16:15:00+00:00,LONG,1824.94,2000.732,2020.5068257990672,96.10293254815528,TRAIL

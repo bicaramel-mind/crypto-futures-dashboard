@@ -1,5 +1,27 @@
 [tool.poetry]
 name = "perp-intel"
 version = "0.1.0"
-description = "Perpetual futures funding/OI/basis intelligence terminal"
+description = "Perpetual futures funding/OI/basis intelligence terminal (Binance USD-M)"
+authors = ["you <you@example.com>"]
 packages = [{ include = "perp_intel", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+httpx = "^0.27.0"
+websockets = "^12.0"
+pydantic = "^2.7.0"
+python-dotenv = "^1.0.1"
+pandas = "^2.2.2"
+numpy = "^2.0.0"
+duckdb = "^1.0.0"
+pyarrow = "^17.0.0"
+streamlit = "^1.37.0"
+altair = "^6.0.0"
+watchdog = "^6.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2.0"
+ruff = "^0.5.0"
+
+[tool.ruff]
+line-length = 100
