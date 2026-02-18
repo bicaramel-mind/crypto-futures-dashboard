@@ -29,8 +29,8 @@ from websocket import WebSocketApp
 # =========================
 # Config
 # =========================
-FAPI_REST = "https://fapi.binance.com"
-FAPI_WS_BASE = "wss://fstream.binance.com/stream?streams="
+FAPI_REST = "https://fapi.binance.us"
+FAPI_WS_BASE = "wss://fstream.binance.us/stream?streams="
 SYMBOL = "ETHUSDT"
 
 # =========================
