@@ -1025,7 +1025,7 @@ with col3:
     st.metric("Margin used", f"${margin_used:,.2f}")
     st.metric("Notional exposure", f"${notional:,.2f}")
     st.caption(f"Rough: ~{rough_wipe_pct:.2f}% adverse move ≈ 100% margin at {leverage}x (ignores fees/maint.).")
-    st.caption(f"ATR (1m): ${df1['atr'].iloc[-1]:.2f}")
+    st.caption(f"ATR (1m): ${htf['atr'].iloc[-1]:.2f}")
 
 st.divider()
 
