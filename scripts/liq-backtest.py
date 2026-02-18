@@ -1,24 +1,25 @@
-# backtest_eth_htf15_liq_oi_grid.py
+# liq-backtest.py  (FULL SCRIPT — patched end-to-end)
 # ETHUSDT futures backtest + grid search (HTF=15m signals, LTF=1m execution)
 #
-# ✅ PATCHED (per your request):
-# - Backtest window set to ~3 months (90 days) of 1m data + 15m warmup
-# - Squeeze-continuation signal using:
+# ✅ Includes all patches requested:
+# - 3 months (90 days) of 1m candles + 15m warmup
+# - Robust REST helper + chunked paging for OI history (fixes 400 on openInterestHist)
+# - Squeeze-continuation signal (15m):
 #     * net liquidation z-score bursts (BUY +, SELL -)
 #     * reclaim vs EMA50 + MACD_hist slope
 #     * OI flush (ΔOI USD < 0) as soft requirement
 # - Entry on 15m boundaries + persistence (configurable)
-# - Parametric proxy liquidation builder (if LIQ_MODE="proxy") so grid can tune it
-# - Full grid search + scoring + min-trade constraint
-# - Writes: equity_curve.csv, trades.csv (for the *last run*), grid_results.csv (for the grid)
+# - Parametric proxy liquidation builder (grid-tunable)
+# - Grid search + scoring + min trade constraint
+# - Writes: grid_results.csv + equity_curve.csv + trades.csv (best config)
 #
 # Run:
 #   pip install pandas numpy requests
-#   python backtest_eth_htf15_liq_oi_grid.py
+#   python liq-backtest.py
 #
 # Notes:
-# - 90 days of 1m candles is large (~129,600 rows). REST paging is implemented with gentle pacing.
-# - Best practice: use real forceOrder liquidation data (LIQ_MODE="file") if you have it.
+# - If you have real forceOrder liquidations, set LIQ_MODE="file" and provide LIQ_FILE.
+# - With 150x + 40% margin, results can be extremely sensitive. Use MIN_TRADES to avoid “3-trade miracles”.
 
 import math
 import time
@@ -34,37 +35,34 @@ FAPI_REST = "https://fapi.binance.com"
 SYMBOL = "ETHUSDT"
 
 # -----------------------------
-# ✅ Backtest window (3 months)
+# Backtest window (✅ 3 months)
 # -----------------------------
 DAYS_1M = 90
-SEED_DAYS_15M = 14  # indicator warmup on 15m
+SEED_DAYS_15M = 14  # warm indicators on 15m
 
 # -----------------------------
-# Default risk/costs (can be overridden by grid)
+# Defaults (overridden by grid)
 # -----------------------------
 TAKER_FEE = 0.0004
 LEVERAGE = 150
 MARGIN_FRAC = 0.40
-LIQ_MOVE = 1.0 / LEVERAGE
+LIQ_MOVE = 1.0 / max(1, LEVERAGE)
 
-# Exits (hours, not days) (can be overridden by grid)
 SL_ATR_MULT = 0.7
 TP_ATR_MULT = 0.9
 TIME_STOP_MIN = 240
-MIN_HOLD_MIN = 0  # keep 0 for simplicity; you can add hold constraints later
 COOLDOWN_AFTER_STOP_MIN = 20
 
-# Risk floor
 EQUITY_FLOOR = 10.0
 
 # -----------------------------
-# Signal logic defaults (can be overridden by grid)
+# Signal defaults (overridden by grid)
 # -----------------------------
 LIQ_Z_WIN_MIN = 90
 LIQ_Z_THRESH = 1.5
 LIQ_Z_ROLL_MIN = 120
 EDGE_PERSIST_BARS = 1
-STRONG_BURST_Z = 2.2  # “very strong burst” threshold
+STRONG_BURST_Z = 2.2
 
 # -----------------------------
 # OI
@@ -78,29 +76,54 @@ OI_LIMIT = 500
 LIQ_MODE = "proxy"          # "proxy" or "file"
 LIQ_FILE = "liq_forceorder_ethusdt.csv"
 
-# -----------------------------
-# REST helpers
-# -----------------------------
-def rest_get_json(path: str, params: dict, timeout=20, max_tries=10):
+# ============================================================
+# REST + time helpers
+# ============================================================
+
+def rest_get_json(path: str, params: dict, timeout=20, max_tries=10, allow_400: bool = False):
+    """
+    Robust REST helper:
+    - retries on 429
+    - optionally returns None (instead of raising) on 400 so callers can split windows
+    """
     url = FAPI_REST + path
     headers = {"User-Agent": "Mozilla/5.0"}
     backoff = 1.0
+    last_err = None
+
     for _ in range(max_tries):
         r = requests.get(url, params=params, timeout=timeout, headers=headers)
+
         if r.status_code == 429:
             time.sleep(backoff)
             backoff = min(backoff * 1.7, 25.0)
             continue
-        r.raise_for_status()
-        return r.json()
-    raise RuntimeError("Rate limited too long (429)")
 
-def utc_ms(ts: pd.Timestamp) -> int:
-    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
-    return int(ts.value // 10**6)
+        if r.status_code == 400 and allow_400:
+            return None
+
+        try:
+            r.raise_for_status()
+        except Exception:
+            last_err = (r.status_code, (r.text or "")[:300])
+            time.sleep(min(backoff, 5.0))
+            backoff = min(backoff * 1.4, 10.0)
+            continue
+
+        return r.json()
+
+    raise RuntimeError(f"REST failed after retries. last_err={last_err}")
 
 def now_utc() -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC")
+
+def utc_ms(ts: pd.Timestamp) -> int:
+    # Be defensive: never tz_localize an already-aware timestamp
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return int(ts.value // 10**6)
 
 def interval_ms(interval: str) -> int:
     interval = interval.strip().lower()
@@ -110,10 +133,12 @@ def interval_ms(interval: str) -> int:
         return int(interval[:-1]) * 60 * 60_000
     raise ValueError(f"Unsupported interval: {interval}")
 
+# ============================================================
+# Data fetchers
+# ============================================================
+
 def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-    """
-    Paged fetch using startTime/limit. Each call returns up to 1500 bars.
-    """
+    """Paged fetch using startTime/limit. Each call returns up to 1500 bars."""
     out = []
     cur = int(start_ms)
     step = interval_ms(interval)
@@ -154,37 +179,97 @@ def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.D
     df["ts"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     for c in ["open","high","low","close","volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+
     df = df[["ts","open","high","low","close","volume"]].rename(columns={"volume":"vol"})
     df = df.dropna().sort_values("ts").drop_duplicates("ts", keep="last").reset_index(drop=True)
     return df
 
 def fetch_oi_hist(symbol: str, period: str, start_ms: int, end_ms: int, limit: int = 500) -> pd.DataFrame:
-    data = rest_get_json("/futures/data/openInterestHist", {
-        "symbol": symbol,
-        "period": period,
-        "limit": limit,
-        "startTime": start_ms,
-        "endTime": end_ms,
-    })
-    if not isinstance(data, list) or len(data) == 0:
+    """
+    ✅ FIX: Binance /futures/data/openInterestHist can 400 for long spans.
+    We page requests in 7-day chunks; if a chunk 400s, split into 1-day chunks.
+    """
+    chunk_ms = 7 * 24 * 60 * 60 * 1000
+    day_ms = 24 * 60 * 60 * 1000
+
+    cur = int(start_ms)
+    rows = []
+    calls = 0
+
+    while cur < end_ms:
+        chunk_end = min(end_ms, cur + chunk_ms)
+
+        data = rest_get_json(
+            "/futures/data/openInterestHist",
+            {
+                "symbol": symbol,
+                "period": period,
+                "limit": limit,
+                "startTime": cur,
+                "endTime": chunk_end,
+            },
+            allow_400=True
+        )
+
+        if data is None:
+            # split to 1-day windows
+            sub_cur = cur
+            while sub_cur < chunk_end:
+                sub_end = min(chunk_end, sub_cur + day_ms)
+                sub = rest_get_json(
+                    "/futures/data/openInterestHist",
+                    {
+                        "symbol": symbol,
+                        "period": period,
+                        "limit": limit,
+                        "startTime": sub_cur,
+                        "endTime": sub_end,
+                    },
+                    allow_400=True
+                )
+                if isinstance(sub, list) and sub:
+                    rows.extend(sub)
+
+                sub_cur = sub_end
+                calls += 1
+                if calls % 10 == 0:
+                    time.sleep(0.15)
+
+            cur = chunk_end
+            continue
+
+        if isinstance(data, list) and data:
+            rows.extend(data)
+
+        cur = chunk_end
+        calls += 1
+        if calls % 8 == 0:
+            time.sleep(0.15)
+        else:
+            time.sleep(0.05)
+
+    if not rows:
         return pd.DataFrame(columns=["ts","oi","oi_usd","d_oi_usd","d_oi_usd_z"])
 
-    df = pd.DataFrame(data)
-    df["ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = pd.DataFrame(rows)
+    df["ts"] = pd.to_datetime(pd.to_numeric(df["timestamp"], errors="coerce"), unit="ms", utc=True)
     df["oi"] = pd.to_numeric(df["sumOpenInterest"], errors="coerce")
     df["oi_usd"] = pd.to_numeric(df["sumOpenInterestValue"], errors="coerce")
-    df = df[["ts","oi","oi_usd"]].dropna().sort_values("ts").reset_index(drop=True)
-    df["d_oi_usd"] = df["oi_usd"].diff()
+    df = df[["ts","oi","oi_usd"]].dropna()
+    df = df.sort_values("ts").drop_duplicates("ts", keep="last").reset_index(drop=True)
 
+    df["d_oi_usd"] = df["oi_usd"].diff()
     roll = 60
     mu = df["d_oi_usd"].fillna(0.0).rolling(roll).mean()
     sd = df["d_oi_usd"].fillna(0.0).rolling(roll).std(ddof=0).replace(0, np.nan)
     df["d_oi_usd_z"] = (df["d_oi_usd"].fillna(0.0) - mu) / sd
+
     return df
 
-# -----------------------------
+# ============================================================
 # Indicators
-# -----------------------------
+# ============================================================
+
 def ema(s: pd.Series, span: int) -> pd.Series:
     return s.ewm(span=span, adjust=False).mean()
 
@@ -225,17 +310,20 @@ def indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["trend_slope"] = out["ema_trend"].diff(30) / out["ema_trend"].shift(30)
     return out
 
-# -----------------------------
+# ============================================================
 # Liquidations
-# -----------------------------
+# ============================================================
+
 def load_liqs_from_file(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     if "ts" not in df.columns:
         raise ValueError("liq file must have column 'ts'")
+
     if np.issubdtype(df["ts"].dtype, np.number):
         df["ts"] = pd.to_datetime(df["ts"].astype(np.int64), unit="ms", utc=True)
     else:
         df["ts"] = pd.to_datetime(df["ts"], utc=True)
+
     df["side"] = df["side"].astype(str).str.upper()
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     df["qty"] = pd.to_numeric(df["qty"], errors="coerce")
@@ -267,19 +355,20 @@ def proxy_liqs_from_1m_parametric(df1m: pd.DataFrame, ret_q: float, vol_q: float
     for _, r in spikes.iterrows():
         notional = float(r["close"] * r["vol"])
         if r["ret_1m"] < 0 or r["wick_dn"] > r["wick_up"]:
-            side = "SELL"
+            side = "SELL"   # down squeeze (longs liquidated proxy)
             price = float(r["low"])
         else:
-            side = "BUY"
+            side = "BUY"    # up squeeze (shorts liquidated proxy)
             price = float(r["high"])
         qty = max(1e-9, notional / max(price, 1e-9))
         events.append({"ts": r["ts"], "side": side, "price": price, "qty": qty, "notional": notional})
 
     return pd.DataFrame(events).sort_values("ts").reset_index(drop=True)
 
-# -----------------------------
-# Net liquidation z-score
-# -----------------------------
+# ============================================================
+# Net liquidation z-score series (BUY +, SELL -)
+# ============================================================
+
 def build_liq_min_z(liqs: pd.DataFrame) -> pd.DataFrame:
     if liqs is None or liqs.empty:
         return pd.DataFrame(columns=["minute","signed_notional","liq_z"]).set_index("minute")
@@ -305,9 +394,10 @@ def liq_window_extrema(liq_min_z: pd.DataFrame, t: pd.Timestamp, win_min: int) -
         return np.nan, np.nan
     return float(w["liq_z"].min()), float(w["liq_z"].max())
 
-# -----------------------------
+# ============================================================
 # Signal: relaxed squeeze-continuation (15m)
-# -----------------------------
+# ============================================================
+
 def htf_signal_continuation(
     htf: pd.DataFrame,
     oi_row: Optional[pd.Series],
@@ -337,7 +427,6 @@ def htf_signal_continuation(
     burst_dn = np.isfinite(min_z) and (min_z < -LIQ_Z_THRESH)
     burst_up = np.isfinite(max_z) and (max_z >  LIQ_Z_THRESH)
 
-    # relaxed: (burst + reclaim + momentum) + (oi_flush OR very strong burst)
     long_ok = burst_dn and reclaim_up and mom_up and (oi_flush or (np.isfinite(min_z) and (min_z < -STRONG_BURST_Z)))
     short_ok = burst_up and reclaim_dn and mom_dn and (oi_flush or (np.isfinite(max_z) and (max_z >  STRONG_BURST_Z)))
 
@@ -347,9 +436,10 @@ def htf_signal_continuation(
         return "SHORT"
     return "WAIT"
 
-# -----------------------------
+# ============================================================
 # Backtest engine
-# -----------------------------
+# ============================================================
+
 @dataclass
 class Trade:
     entry_ts: pd.Timestamp
@@ -392,7 +482,7 @@ def run_backtest(
     htf_idx = np.searchsorted(htf_map.index.values, df1m["ts"].values, side="right") - 1
 
     # OI to 1m
-    oi_map = oi.set_index("ts").sort_index().reindex(df1m["ts"]).ffill()
+    oi_map = oi.set_index("ts").sort_index().reindex(df1m["ts"]).ffill() if len(oi) else pd.DataFrame()
 
     def is_15m_boundary(ts: pd.Timestamp) -> bool:
         return (ts.minute % 15 == 0)
@@ -476,7 +566,7 @@ def run_backtest(
         if pos_side is not None:
             hold_min = int((t - entry_ts) / pd.Timedelta(minutes=1))
 
-            # liquidation intrabar (simple)
+            # liquidation intrabar
             if pos_side == "LONG":
                 liq_px = entry_px * (1.0 - LIQ_MOVE)
                 if l <= liq_px:
@@ -486,6 +576,7 @@ def run_backtest(
                 if h >= liq_px:
                     close_trade(i, liq_px, "LIQ"); eq[i] = equity; continue
 
+            # exits via 15m ATR
             atr15 = float(htf_slice["atr"].iloc[-1]) if np.isfinite(htf_slice["atr"].iloc[-1]) else np.nan
             if np.isfinite(atr15) and atr15 > 0:
                 if pos_side == "LONG":
@@ -520,7 +611,7 @@ def run_backtest(
 
         eq[i] = equity
 
-    # Force close
+    # Force close at end
     if pos_side is not None and equity >= EQUITY_FLOOR:
         i = len(df1m) - 1
         close_trade(i, float(df1m["close"].iloc[i]), "EOD")
@@ -554,9 +645,20 @@ def run_backtest(
     }
     return curve, trades_df, metrics
 
-# -----------------------------
-# Grid-run wrapper
-# -----------------------------
+# ============================================================
+# Grid utilities
+# ============================================================
+
+def score_row(m: Dict) -> float:
+    # Balanced score: return + sharpe - drawdown + mild trade encouragement + mild win-rate bonus
+    return float(
+        2.0 * m.get("return_pct", 0.0)
+        + 0.4 * m.get("sharpe_1m_ann", 0.0)
+        - 1.5 * abs(m.get("max_drawdown", 0.0))
+        + 0.18 * np.log1p(max(0, int(m.get("trades", 0))))
+        + 0.25 * (m.get("win_rate", 0.0) - 0.5)
+    )
+
 def run_one_config(
     df1m: pd.DataFrame,
     df15m_ind: pd.DataFrame,
@@ -586,23 +688,23 @@ def run_one_config(
     global SL_ATR_MULT, TP_ATR_MULT, TIME_STOP_MIN, COOLDOWN_AFTER_STOP_MIN
     global LEVERAGE, MARGIN_FRAC, TAKER_FEE, LIQ_MOVE
 
-    LIQ_Z_THRESH = liq_z_thresh
-    LIQ_Z_WIN_MIN = liq_z_win_min
-    LIQ_Z_ROLL_MIN = liq_z_roll_min
-    STRONG_BURST_Z = strong_burst_z
-    EDGE_PERSIST_BARS = edge_persist_bars
+    LIQ_Z_THRESH = float(liq_z_thresh)
+    LIQ_Z_WIN_MIN = int(liq_z_win_min)
+    LIQ_Z_ROLL_MIN = int(liq_z_roll_min)
+    STRONG_BURST_Z = float(strong_burst_z)
+    EDGE_PERSIST_BARS = int(edge_persist_bars)
 
-    SL_ATR_MULT = sl_atr_mult
-    TP_ATR_MULT = tp_atr_mult
-    TIME_STOP_MIN = time_stop_min
-    COOLDOWN_AFTER_STOP_MIN = cooldown_min
+    SL_ATR_MULT = float(sl_atr_mult)
+    TP_ATR_MULT = float(tp_atr_mult)
+    TIME_STOP_MIN = int(time_stop_min)
+    COOLDOWN_AFTER_STOP_MIN = int(cooldown_min)
 
     LEVERAGE = int(leverage)
     MARGIN_FRAC = float(margin_frac)
     TAKER_FEE = float(taker_fee)
     LIQ_MOVE = 1.0 / max(1, LEVERAGE)
 
-    # build liquidations for this config
+    # liquidations for this config
     if LIQ_MODE == "proxy":
         liqs = proxy_liqs_from_1m_parametric(df1m, ret_q=proxy_ret_q, vol_q=proxy_vol_q, wick_q=proxy_wick_q)
     else:
@@ -610,8 +712,8 @@ def run_one_config(
 
     liq_min_z = build_liq_min_z(liqs)
 
-    # if z baseline is too weak, treat as no-trade
-    if liq_min_z.empty or len(liq_min_z) < max(60, liq_z_roll_min // 2):
+    # If z baseline is too weak, treat as no-trade
+    if liq_min_z.empty or len(liq_min_z) < max(60, LIQ_Z_ROLL_MIN // 2):
         curve = pd.DataFrame({"ts": df1m["ts"], "equity": np.nan})
         trades = pd.DataFrame()
         metrics = {
@@ -629,22 +731,21 @@ def run_one_config(
             warmup_15m=120
         )
 
-    # attach config to metrics
     metrics = dict(metrics)
     metrics.update({
         "score": np.nan,
-        "liq_z_thresh": liq_z_thresh,
-        "liq_z_win_min": liq_z_win_min,
-        "liq_z_roll_min": liq_z_roll_min,
-        "strong_burst_z": strong_burst_z,
-        "edge_persist_bars": edge_persist_bars,
-        "sl_atr_mult": sl_atr_mult,
-        "tp_atr_mult": tp_atr_mult,
-        "time_stop_min": time_stop_min,
-        "cooldown_min": cooldown_min,
-        "leverage": leverage,
-        "margin_frac": margin_frac,
-        "taker_fee": taker_fee,
+        "liq_z_thresh": LIQ_Z_THRESH,
+        "liq_z_win_min": LIQ_Z_WIN_MIN,
+        "liq_z_roll_min": LIQ_Z_ROLL_MIN,
+        "strong_burst_z": STRONG_BURST_Z,
+        "edge_persist_bars": EDGE_PERSIST_BARS,
+        "sl_atr_mult": SL_ATR_MULT,
+        "tp_atr_mult": TP_ATR_MULT,
+        "time_stop_min": TIME_STOP_MIN,
+        "cooldown_min": COOLDOWN_AFTER_STOP_MIN,
+        "leverage": LEVERAGE,
+        "margin_frac": MARGIN_FRAC,
+        "taker_fee": TAKER_FEE,
         "proxy_ret_q": proxy_ret_q,
         "proxy_vol_q": proxy_vol_q,
         "proxy_wick_q": proxy_wick_q,
@@ -653,19 +754,10 @@ def run_one_config(
     })
     return curve, trades, metrics
 
-def score_row(m: Dict) -> float:
-    # Balanced score: return + sharpe - drawdown + mild trade encouragement + mild win-rate bonus
-    return float(
-        2.0 * m.get("return_pct", 0.0)
-        + 0.4 * m.get("sharpe_1m_ann", 0.0)
-        - 1.5 * abs(m.get("max_drawdown", 0.0))
-        + 0.18 * np.log1p(max(0, int(m.get("trades", 0))))
-        + 0.25 * (m.get("win_rate", 0.0) - 0.5)
-    )
-
-# -----------------------------
+# ============================================================
 # Main
-# -----------------------------
+# ============================================================
+
 if __name__ == "__main__":
     end = now_utc().floor("min")
     start_1m = end - pd.Timedelta(days=DAYS_1M)
@@ -685,22 +777,28 @@ if __name__ == "__main__":
 
     df15m_ind = indicators(df15m)
 
+    # ✅ sanity print for OI timestamps
+    print("OI request start/end UTC:",
+          pd.to_datetime(start_1m_ms, unit="ms", utc=True),
+          pd.to_datetime(end_ms, unit="ms", utc=True))
+
     print(f"Fetching OI hist ({OI_PERIOD}) ...")
     oi = fetch_oi_hist(SYMBOL, OI_PERIOD, start_1m_ms, end_ms, limit=OI_LIMIT)
     print("OI rows:", len(oi))
 
-    # Base liquidations (for LIQ_MODE="file" we use this; for proxy, grid builds per-config)
+    # Base liquidations (used if LIQ_MODE="file"; proxy is built per-config)
     if LIQ_MODE == "file":
         print("Loading REAL forceOrder liqs from file:", LIQ_FILE)
         liqs_base = load_liqs_from_file(LIQ_FILE)
+        print("Liq events:", len(liqs_base))
     else:
         print("LIQ_MODE=proxy: grid will build proxy liqs per config")
         liqs_base = pd.DataFrame(columns=["ts","side","price","qty","notional"])
 
     # -----------------------------
-    # ✅ Grid Search
+    # Grid Search
     # -----------------------------
-    MIN_TRADES = 8  # enforce "take more trades" (tune)
+    MIN_TRADES = 8  # enforce "more trades"
     leverage_fixed = 150
     margin_fixed = 0.40
     taker_fee_fixed = 0.0004
@@ -726,13 +824,13 @@ if __name__ == "__main__":
     total = 1
     for v in vals:
         total *= len(v)
-    print(f"\nGrid size: {total} configs")
 
+    print(f"\nGrid size: {total} configs")
     results = []
     best_row = None
 
-    # Optional: cap grid for quick iteration (set to None for full)
-    MAX_CONFIGS = None  # e.g., 5000 to cap; None = run all
+    # Optional: cap configs for faster iteration; set None to run all
+    MAX_CONFIGS = None  # e.g., 5000, or None
 
     n = 0
     for combo in product(*vals):
@@ -741,7 +839,6 @@ if __name__ == "__main__":
             break
 
         cfg = dict(zip(keys, combo))
-
         curve_df, trades_df, metrics = run_one_config(
             df1m=df1m[["ts","open","high","low","close","vol"]],
             df15m_ind=df15m_ind,
@@ -762,7 +859,6 @@ if __name__ == "__main__":
             print(f"  progress: {n}/{(MAX_CONFIGS or total)}  best_score={best_row['score']:.4f}  best_trades={best_row['trades']}")
 
     dfres = pd.DataFrame(results)
-
     dfok = dfres[dfres["trades"] >= MIN_TRADES].copy()
     if dfok.empty:
         print("\nNo configs met MIN_TRADES. Ranking without the trade filter.")
@@ -782,7 +878,7 @@ if __name__ == "__main__":
     print(dfok[show_cols].head(15).to_string(index=False))
 
     # -----------------------------
-    # Run & export trades/equity for the best config
+    # Export best config equity/trades
     # -----------------------------
     best = dfok.iloc[0].to_dict()
     print("\nRunning best config and exporting equity_curve.csv + trades.csv ...")
